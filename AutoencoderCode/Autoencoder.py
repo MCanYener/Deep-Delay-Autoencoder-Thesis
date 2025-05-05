@@ -7,6 +7,9 @@ import torchmetrics
 from torch.autograd import grad
 import pysindy as ps
 from pysindy.differentiation import FiniteDifference
+import traceback
+from sklearn.exceptions import NotFittedError
+from math import comb
 
 # This callback is used to update mask, i.e. apply recursive feature elimination in Sindy at the beginning of each epoch
 class RfeUpdateCallback:
@@ -37,71 +40,95 @@ class RfeUpdateCallback:
 
 # This class is used to fit a SINDy model to the latent space representation of the data.
 class SindyCall:
-    def __init__(self, model, threshold, update_freq, x, t):
+    def __init__(self, model, params, threshold, update_freq, x, t):
         """
-        PyTorch version of SindyCall to update the SINDy model periodically.
+        PyTorch-compatible SINDy callback using SR3 and explicit derivatives.
 
         Parameters:
-        - model: The PreSVD_Sindy_Autoencoder model.
-        - threshold: STLSQ threshold for sparse regression.
-        - update_freq: Frequency of SINDy model updates during training.
-        - x: Input data.
-        - t: Time array corresponding to `x`.
+        - model: PreSVD_Sindy_Autoencoder model
+        - params: full parameter dictionary
+        - threshold: SR3 sparsity threshold
+        - update_freq: how often to update coefficients (in epochs)
+        - x: input time-series data (training)
+        - t: time vector corresponding to x
         """
-        self.model = model  # PreSVD_Sindy_Autoencoder
+        self.model = model
+        self.params = params
         self.threshold = threshold
         self.update_freq = update_freq
         self.t = t
         self.x = x
-
+        self.poly_order = params.get("poly_order", 3)
+        self.dt = params.get("dt", 0.01)
 
     def update_sindy(self, epoch):
-        """
-        Fit SINDy to latent trajectory and overwrite trainable coefficients.
-        """
-        if epoch % self.update_freq != 0 or epoch <= 1:
+        if epoch < self.params.get("sindycall_start", 60):
+            return
+        if epoch % self.update_freq != 0:
             return
 
-        print('--- Running SINDy ---')
+        print("\n--- Running SINDy (Explicit Derivatives, Unconstrained) ---")
 
-        # Get latent representation
-        x_tensor = torch.tensor(self.x, dtype=torch.float32).to(next(self.model.parameters()).device)
+        # Step 1: Get latent trajectory
+        device = next(self.model.parameters()).device
+        x_tensor = torch.tensor(self.x, dtype=torch.float32).to(device)
+
         with torch.no_grad():
             z_latent = self.model.encoder(x_tensor).cpu().numpy()
 
-        dt = self.model.params['dt']
-        print(f"[DEBUG] z_latent.shape = {z_latent.shape}")
-        print(f"[DEBUG] dt              = {dt:.5f}")
+        if z_latent.ndim == 3:
+            z_latent = z_latent.squeeze(0)
+        elif z_latent.ndim != 2:
+            raise ValueError(f"[ERROR] Unexpected z_latent shape: {z_latent.shape}")
 
-        # Construct SINDy model
-        library = ps.PolynomialLibrary(degree=self.model.poly_order)
+        print(f"[DEBUG] z_latent.shape = {z_latent.shape}")
+        print(f"[DEBUG] std(z) = {np.std(z_latent, axis=0)}")
+
+        # Step 2: Compute explicit derivatives
+        z_dot = np.gradient(z_latent, self.dt, axis=0)
+
+        # Step 3: Define SINDy model
+        #if epoch < 100:
+        #    optimizer = ps.SR3(threshold=0.01, nu=1e-3)
+        #else:
+        #    optimizer = ps.SR3(threshold=self.threshhold, nu=1e-2)
         optimizer = ps.STLSQ(threshold=self.threshold)
+        library = ps.PolynomialLibrary(degree=self.poly_order)
+
         sindy_model = ps.SINDy(
+            optimizer=optimizer,
             feature_library=library,
-            optimizer=optimizer
+            feature_names=[f"z{i}" for i in range(z_latent.shape[1])],
+            discrete_time=False
         )
 
-        # Fit model to latent dynamics
-        t_span = np.arange(z_latent.shape[0]) * dt
-        sindy_model.fit([z_latent], t=[t_span], quiet=True)
-        print(f"Is this thing on?")
-        sindy_model.print()
+        # Step 4: Fit model with explicit derivatives
+        try:
+            sindy_model.fit(z_latent, x_dot=z_dot, t=self.dt, quiet=True)
+            print("✅ SINDy fit successful.")
+            sindy_model.print()
+        except Exception as e:
+            print(f"[ERROR] Exception during SINDy fit: {e}")
+            traceback.print_exc()
+            return
 
-        # Get learned coefficients
-        sindy_coefs = torch.tensor(sindy_model.coefficients().T, dtype=torch.float32).to(x_tensor.device)
-
-        # Apply fixed coefficient constraints
-        fixed_mask = self.model.sindy.fixed_mask.to(sindy_coefs.device)
-        fixed_values = self.model.sindy.fixed_values.to(sindy_coefs.device)
-        updated_coefs = torch.where(fixed_mask, fixed_values, sindy_coefs)
-
-        # Overwrite only trainable coefficients
+        # Step 5: Safely transplant coefficients with constraints
         with torch.no_grad():
-            self.model.sindy.coefficients_trainable.data = updated_coefs[~fixed_mask]
+            new_coefs = torch.tensor(sindy_model.coefficients().T, dtype=torch.float32).to(device)
 
-        # Update sparsity mask for potential RFE
-        self.model.sindy.coefficients_mask = (updated_coefs.abs() > 1e-5).float()
+            # Re-impose fixed constraints
+            fixed_mask = self.model.sindy.fixed_mask.to(device)
+            fixed_values = self.model.sindy.fixed_values.to(device)
 
+            new_coefs[fixed_mask] = fixed_values[fixed_mask]
+
+            # In-place overwrite of 2D parameter
+            self.model.sindy.coefficients.data.copy_(new_coefs)
+
+            print("[DEBUG] coefficients updated in-place from SINDy fit.")
+
+            # Optional: update mask for logging or RFE tracking
+            self.model.sindy.coefficients_mask = (new_coefs.abs() > 1e-5).float()
 
 
 # This class is initialized by the Autoencoder Network to create the SINDy model.
@@ -132,47 +159,40 @@ class Sindy(nn.Module):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # --- Fixed coefficients ---
+        # --- Fixed and trainable mask ---
         self.fixed_mask = torch.tensor(fixed_mask, dtype=torch.bool, device=device) if fixed_mask is not None else torch.zeros((library_dim, state_dim), dtype=torch.bool, device=device)
         self.fixed_values = torch.tensor(fixed_values, dtype=torch.float32, device=device) if fixed_values is not None else torch.zeros((library_dim, state_dim), dtype=torch.float32, device=device)
-        self.trainable_mask = (~self.fixed_mask).to(torch.bool)
-        self.num_trainable = self.trainable_mask.sum().item()
 
-        # --- Trainable coefficients ---
-        init_val = coefficient_init_val
-        trainable_init = torch.full((self.num_trainable,), init_val, dtype=torch.float32, device=device)
-        self.coefficients_trainable = nn.Parameter(trainable_init)
-        self.sparsity_mask = torch.ones_like(self.coefficients_trainable.data, dtype=torch.bool)
-        self.coefficients_trainable.register_hook(
-            lambda grad: grad * self.sparsity_mask.float()
-        )
+        # --- Full 2D coefficient matrix ---
+        self.coefficients = nn.Parameter(torch.full((library_dim, state_dim),
+                                                    coefficient_init_val,
+                                                    dtype=torch.float32,
+                                                    device=device))
+        # Initialize with fixed values where required
+        self.coefficients.data[self.fixed_mask] = self.fixed_values[self.fixed_mask]
 
+        # --- Hook to mask gradients at fixed locations ---
+        def mask_grad(grad):
+            return grad * (~self.fixed_mask).float()
 
-        # --- Optional neural net theta ---
+        self.coefficients.register_hook(mask_grad)
+
+        # Optional neural network for theta
         if self.ode_net:
             self.net_model = self.make_theta_network(self.library_dim, self.ode_net_widths)
 
-    def build_full_coeff_matrix(self):
-        device = self.coefficients_trainable.device
-        coeffs_full = self.fixed_values.to(device).clone()
-        trainable_mask = self.trainable_mask.to(device)
-        coeffs_full[trainable_mask] = self.coefficients_trainable
-
-        # Strict enforcement check
-        if not torch.allclose(
-            coeffs_full[self.fixed_mask],
-            self.fixed_values[self.fixed_mask].to(device),
-            atol=1e-6
-        ):
-            raise RuntimeError("❌ Fixed coefficients are being overwritten!")
-
-        return coeffs_full
-
     def forward(self, z):
         theta_z = self.theta(z)
-        coeffs_full = self.build_full_coeff_matrix().to(z.device)
-        dz_dt = torch.matmul(theta_z, coeffs_full)
-        return dz_dt
+        return torch.matmul(theta_z, self.coefficients.to(z.device))
+
+    def theta(self, z):
+        if self.ode_net:
+            return self.net_model(z)
+        else:
+            return self.sindy_library(z, z.shape[1], self.poly_order,
+                                      include_sine=self.include_sine,
+                                      exact_features=self.exact_features,
+                                      model=self.model)
 
     def make_theta_network(self, output_dim, widths):
         layers = []
@@ -183,16 +203,6 @@ class Sindy(nn.Module):
             input_dim = int(width * input_dim)
         layers.append(nn.Linear(input_dim, output_dim))
         return nn.Sequential(*layers)
-
-    def theta(self, z):
-        if self.ode_net:
-            return self.net_model(z)
-        else:
-            return self.sindy_library(z, z.shape[1], self.poly_order, self.include_sine, self.exact_features, self.model)
-
-    @property
-    def coefficients(self):
-        return self.build_full_coeff_matrix()
 
     def sindy_library(self, z, latent_dim, poly_order, include_sine=False, exact_features=False, model='lorenz'):
         library = [torch.ones(z.shape[0], dtype=torch.float32, device=z.device)]
@@ -231,6 +241,11 @@ class Sindy(nn.Module):
 
         return torch.stack(library, dim=1)
 
+    def reset_parameters(self):
+        with torch.no_grad():
+            self.coefficients.data.uniform_(-0.1, 0.1)
+            self.coefficients.data[self.fixed_mask] = self.fixed_values[self.fixed_mask]
+
     def update_mask(self):
         if self.rfe_threshold is not None:
             self.coefficients_mask = (torch.abs(self.coefficients) > self.rfe_threshold).float()
@@ -249,11 +264,12 @@ class Sindy(nn.Module):
             print(" | ".join(row))
 
         print("Legend: O = trainable, X = fixed")
-        print(f"Total trainable: {self.trainable_mask.sum().item()} / {self.library_dim * self.state_dim}")
+        print(f"Total trainable: {(~self.fixed_mask).sum().item()} / {self.library_dim * self.state_dim}")
 
+    
 # This class is the main autoencoder model that combines the encoder, decoder, and SINDy model. Used with and SVD input.
 class PreSVD_Sindy_Autoencoder(nn.Module):
-    def __init__(self, params, hankel = None):
+    def __init__(self, params, hankel=None):
         super(PreSVD_Sindy_Autoencoder, self).__init__()
         self.params = params
         self.latent_dim = params['latent_dim']
@@ -270,6 +286,7 @@ class PreSVD_Sindy_Autoencoder(nn.Module):
         self.use_bias = params['use_bias']
         self.l2 = params['loss_weight_layer_l2']
         self.l1 = params['loss_weight_layer_l1']
+
         self.total_loss_metric = torchmetrics.MeanMetric()
         self.rec_loss_metric = torchmetrics.MeanMetric()
         self.sindy_z_loss_metric = torchmetrics.MeanMetric()
@@ -277,7 +294,18 @@ class PreSVD_Sindy_Autoencoder(nn.Module):
         self.integral_loss_metric = torchmetrics.MeanMetric()
         self.x0_loss_metric = torchmetrics.MeanMetric()
         self.l1_loss_metric = torchmetrics.MeanMetric()
+
+        # ✅ Compute the number of polynomial features
+        def compute_library_dim(latent_dim, poly_order):
+            return sum([comb(latent_dim + i - 1, i) for i in range(1, poly_order + 1)]) + 1  # +1 for constant term
+
+        num_library_terms = compute_library_dim(self.latent_dim, self.poly_order)
+
+        # ✅ Hankel embedding (if used)
         self.hankel = torch.tensor(hankel, dtype=torch.float32) if hankel is not None else None
+
+        # ✅ Writable matrix for SINDyCall
+        self.coefficients_matrix = torch.zeros((self.latent_dim, num_library_terms))
 
         # Define time constant
         self.time = torch.linspace(0.0, params['dt'] * params['svd_dim'], params['svd_dim'])

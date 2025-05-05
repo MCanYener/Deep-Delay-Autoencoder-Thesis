@@ -119,6 +119,7 @@ class TrainModel:
         if self.params.get("use_sindycall", True):
             self.sindy_caller = SindyCall(
                 model=self.model,
+                params=self.params,
                 threshold=self.params["coefficient_threshold"],
                 update_freq=self.params.get("update_freq", 10),
                 x=self.data.x,
@@ -146,28 +147,26 @@ class TrainModel:
                 optimizer.step()
 
                 with torch.no_grad():
-                    coeffs = self.model.sindy.coefficients_trainable
-                    new_mask = coeffs.abs() > self.params["coefficient_threshold"]
-                    coeffs *= new_mask.float()  # Zero out small values
+                    # Strict enforcement of fixed entries
+                    fixed_mask = self.model.sindy.fixed_mask
+                    fixed_vals = self.model.sindy.fixed_values
+                    coeffs = self.model.sindy.coefficients
 
-                    # Update the gradient mask to prevent regrowth
-                    self.model.sindy.sparsity_mask.copy_(new_mask)
+                    # Reset any drifted fixed values (in case of numerical error)
+                    coeffs[fixed_mask] = fixed_vals[fixed_mask]
 
-                with torch.no_grad():
-                    coeffs_full = self.model.sindy.build_full_coeff_matrix()
-                    if (coeffs_full[self.model.sindy.fixed_mask] != self.model.sindy.fixed_values[self.model.sindy.fixed_mask].to(coeffs_full.device)).any():
-                        print("❌ Sanity Check Failed: Fixed coefficients were changed.")
+                    # Optional: enforce soft sparsity mask manually (RFE style)
+                    if self.params.get("coefficient_threshold") is not None:
+                        mask = coeffs.abs() > self.params["coefficient_threshold"]
+                        coeffs *= mask.float()  # zero out small coefficients
+                        self.model.sindy.coefficients_mask = mask
 
-                with torch.no_grad():
-                    full_coeffs = self.model.sindy.coefficients
-                    fixed_mask = self.model.sindy.fixed_mask.to(full_coeffs.device)
-                    fixed_vals = self.model.sindy.fixed_values.to(full_coeffs.device)
-
-                    if not torch.allclose(full_coeffs[fixed_mask], fixed_vals[fixed_mask]):
+                    # Double check that constraints hold
+                    if not torch.allclose(coeffs[fixed_mask], fixed_vals[fixed_mask], atol=1e-6):
                         print("❌ Fixed coefficient mismatch!")
-                        diff = full_coeffs[fixed_mask] - fixed_vals[fixed_mask]
+                        diff = coeffs[fixed_mask] - fixed_vals[fixed_mask]
                         print("Max difference:", diff.abs().max().item())
-                        print("Full matrix:\n", full_coeffs.cpu().numpy())
+                        print("Full matrix:\n", coeffs.cpu().numpy())
                         print("Expected fixed values:\n", fixed_vals.cpu().numpy())
                 epoch_loss += loss.item()
 
@@ -184,12 +183,18 @@ class TrainModel:
 
             scheduler.step()
 
-            if epoch % 10 == 0:
+            if epoch % self.params["loss_print_rate"] == 0:
                 print(f"Epoch {epoch}: Loss = {epoch_loss:.6f} | LR = {optimizer.param_groups[0]['lr']:.6f}")
 
-            if epoch % 5 == 0:
+            if epoch % self.params["sindy_print_rate"] == 0:
                 print("--- SINDy Coefficient Matrix (Sanity Check) ---")
                 print(self.model.sindy.coefficients.detach().cpu().numpy())
+
+            with torch.no_grad():
+                coeff_matrix = self.model.sindy.coefficients
+                if torch.isnan(coeff_matrix).any():
+                    print("❌ SINDy matrix contains NaN entities! Stopping training.")
+                    raise RuntimeError("SINDy matrix contains NaN entities!")
 
             # ✅ Trigger SINDyCall if active
             if self.sindy_caller:
