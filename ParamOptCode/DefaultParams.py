@@ -32,7 +32,7 @@ params = {
     'loss_weight_layer_l1': 0.0,
 
     # SINDy
-    'coefficient_threshold': 0.1,
+    'coefficient_threshold': 0.01,
     'threshold_frequency': 5,
     'print_frequency': 10,
     'sindy_pert': 0.0,
@@ -42,6 +42,7 @@ params = {
     'use_bias': True,
     'tend': 32,
     'dt': 0.01,
+    'rfe_frequency': 10,
 
     # Misc
     'train_ratio': 0.8,
@@ -49,37 +50,40 @@ params = {
     'save_checkpoints': False,
     'save_freq': 5,
     'learning_rate_sched': False,
-    'use_sindycall': True,
+    'use_sindycall': False,
+    'sindycall_start': 60,
+    'sindy_print_rate': 10,
+    'loss_print_rate': 10,
     'sparse_weighting': None,
     'system_coefficients': None,
     'update_freq': 10,
 
     #Constraints
     
-#    "sindy_fixed_mask": np.array([
-#        [False, False, False],
-#        [False, False, False],
-#        [False,  True, False],
-#        [False, False, False],
-#        [False, False, False],
-#        [False,  True, False],
-#        [False, False, False],
-#        [ True,  True,  True],
-#        [ True,  True,  True],
-#        [ True,  True,  True],
-#    ], dtype=bool),
     "sindy_fixed_mask": np.array([
-        [False, False, False],
-        [False, False, False],
-        [False,  False, False],
-        [False, False, False],
-        [False, False, False],
-        [False,  False, False],
-        [False, False, False],
-        [ False,  False,  False],
-        [ False,  False,  False],
-        [ False,  False,  False],
+        [True, True, True], #1
+        [False, False, False], #x
+        [False,  True, False], #y
+        [False, False, False], #z
+        [False, False, False], #xy
+        [False,  False, False], #yz
+        [False, True, False], #xz
+        [ True,  True,  True], #x^2
+        [ True,  True,  True], #y^2
+        [ True,  True,  True], #z^2
     ], dtype=bool),
+#    "sindy_fixed_mask": np.array([
+#       [False, False, False],
+#       [False, False, False],
+#        [False,  False, False],
+#        [False, False, False],
+#        [False, False, False],
+#        [False,  False, False],
+#        [False, False, False],
+#        [ False,  False,  False],
+#        [ False,  False,  False],
+#        [ False,  False,  False],
+#    ], dtype=bool),
 
     "sindy_fixed_values": np.array([
         [0.,  0.,  0.],
@@ -87,8 +91,8 @@ params = {
         [0., -1.,  0.],
         [0.,  0.,  0.],
         [0.,  0.,  0.],
-        [0.,  1.,  0.],
         [0.,  0.,  0.],
+        [0.,  -1.,  0.],
         [0.,  0.,  0.],
         [0.,  0.,  0.],
         [0.,  0.,  0.],

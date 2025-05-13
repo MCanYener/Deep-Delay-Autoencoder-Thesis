@@ -10,6 +10,7 @@ from collections import defaultdict
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
 
 from SINDyCode.SINDyPreamble import library_size, sindy_library
 from SINDyCode.SINDyPreamble import sindy_library as preamble_sindy_library
@@ -39,6 +40,13 @@ class TrainModel:
         input_dim = params["input_dim"]
         params["widths"] = [int(i * input_dim) for i in params["widths_ratios"]]
 
+        if "coefficient_threshold" not in params:
+            params["coefficient_threshold"] = 1e-2
+        params["rfe_threshold"] = params["coefficient_threshold"]
+
+        print("[DEBUG] Final coefficient_threshold:", params["coefficient_threshold"])
+        print("[DEBUG] Final rfe_threshold:", params["rfe_threshold"])
+
         # Only considering Lorenz model
         params["library_dim"] = library_size(
             params["latent_dim"], params["poly_order"], params["include_sine"]
@@ -54,6 +62,7 @@ class TrainModel:
                     self.data.z[:100, :],
                     params["poly_order"],
                     include_sparse_weighting=True,
+                    include_names=True,  # <-- add this line
                     include_sine=params.get("include_sine", False),
                     exact_features=params.get("exact_features", False)
                 )
@@ -87,7 +96,7 @@ class TrainModel:
             print("❌ sindy_fixed_values is None")
         else:
             print(np.array(fv))
-
+        print("[DEBUG] rfe_threshold at model creation:", self.params.get("rfe_threshold"))
         return PreSVD_Sindy_Autoencoder(self.params, hankel = self.hankel)
 
     def fit(self):
@@ -119,6 +128,7 @@ class TrainModel:
         if self.params.get("use_sindycall", True):
             self.sindy_caller = SindyCall(
                 model=self.model,
+                params=self.params,
                 threshold=self.params["coefficient_threshold"],
                 update_freq=self.params.get("update_freq", 10),
                 x=self.data.x,
@@ -126,6 +136,12 @@ class TrainModel:
             )
         else:
             self.sindy_caller = None
+        
+        rfe_callback = RfeUpdateCallback(self.model, 
+                                 rfe_frequency=self.params.get("rfe_frequency", 10),
+                                 print_frequency=self.params.get("sindy_print_rate", 10))
+        
+        print("Launching training with coefficient_threshold =", self.params["coefficient_threshold"])
 
         for epoch in range(self.params["max_epochs"]):
             self.model.train()
@@ -146,29 +162,28 @@ class TrainModel:
                 optimizer.step()
 
                 with torch.no_grad():
-                    coeffs = self.model.sindy.coefficients_trainable
-                    new_mask = coeffs.abs() > self.params["coefficient_threshold"]
-                    coeffs *= new_mask.float()  # Zero out small values
+                    # Strict enforcement of fixed entries
+                    fixed_mask = self.model.sindy.fixed_mask
+                    fixed_vals = self.model.sindy.fixed_values
+                    coeffs = self.model.sindy.coefficients
 
-                    # Update the gradient mask to prevent regrowth
-                    self.model.sindy.sparsity_mask.copy_(new_mask)
+                    # Reset any drifted fixed values (in case of numerical error)
+                    coeffs[fixed_mask] = fixed_vals[fixed_mask]
 
-                with torch.no_grad():
-                    coeffs_full = self.model.sindy.build_full_coeff_matrix()
-                    if (coeffs_full[self.model.sindy.fixed_mask] != self.model.sindy.fixed_values[self.model.sindy.fixed_mask].to(coeffs_full.device)).any():
-                        print("❌ Sanity Check Failed: Fixed coefficients were changed.")
+                    # Optional: enforce soft sparsity mask manually (RFE style)
+                    if self.params.get("coefficient_threshold") is not None:
+                        mask = coeffs.abs() > self.params["coefficient_threshold"]
+                        coeffs *= mask.float()  # zero out small coefficients
+                        self.model.sindy.coefficients_mask = mask
 
-                with torch.no_grad():
-                    full_coeffs = self.model.sindy.coefficients
-                    fixed_mask = self.model.sindy.fixed_mask.to(full_coeffs.device)
-                    fixed_vals = self.model.sindy.fixed_values.to(full_coeffs.device)
-
-                    if not torch.allclose(full_coeffs[fixed_mask], fixed_vals[fixed_mask]):
+                    # Double check that constraints hold
+                    if not torch.allclose(coeffs[fixed_mask], fixed_vals[fixed_mask], atol=1e-6):
                         print("❌ Fixed coefficient mismatch!")
-                        diff = full_coeffs[fixed_mask] - fixed_vals[fixed_mask]
+                        diff = coeffs[fixed_mask] - fixed_vals[fixed_mask]
                         print("Max difference:", diff.abs().max().item())
-                        print("Full matrix:\n", full_coeffs.cpu().numpy())
+                        print("Full matrix:\n", coeffs.cpu().numpy())
                         print("Expected fixed values:\n", fixed_vals.cpu().numpy())
+
                 epoch_loss += loss.item()
 
                 # Log all sub-losses
@@ -184,16 +199,59 @@ class TrainModel:
 
             scheduler.step()
 
-            if epoch % 10 == 0:
+            # 🔍 LOG average coefficient stats (ADD HERE)
+            trainable_mask = ~fixed_mask
+            mean_all = coeffs[trainable_mask].abs().mean().item()
+            mean_per_column = []
+            for j in range(coeffs.shape[1]):
+                col_mask = trainable_mask[:, j]
+                if col_mask.sum() > 0:
+                    mean_per_column.append(coeffs[:, j][col_mask].abs().mean().item())
+                else:
+                    mean_per_column.append(float('nan'))
+
+            self.history['mean_coef_all'].append(mean_all)
+            self.history['mean_coef_per_col'].append(mean_per_column)
+
+            if epoch % self.params["loss_print_rate"] == 0:
                 print(f"Epoch {epoch}: Loss = {epoch_loss:.6f} | LR = {optimizer.param_groups[0]['lr']:.6f}")
 
-            if epoch % 5 == 0:
+            if epoch % self.params["sindy_print_rate"] == 0:
                 print("--- SINDy Coefficient Matrix (Sanity Check) ---")
                 print(self.model.sindy.coefficients.detach().cpu().numpy())
+
+            with torch.no_grad():
+                coeff_matrix = self.model.sindy.coefficients
+                if torch.isnan(coeff_matrix).any():
+                    print("❌ SINDy matrix contains NaN entities! Stopping training.")
+                    raise RuntimeError("SINDy matrix contains NaN entities!")
+            
+            rfe_callback.update_rfe(epoch)
 
             # ✅ Trigger SINDyCall if active
             if self.sindy_caller:
                 self.sindy_caller.update_sindy(epoch)
+
+                # --- Plot average coefficient magnitude ---
+        plt.figure(figsize=(10, 4))
+        plt.plot(self.history['mean_coef_all'], label='Mean of All Trainable Coefficients')
+        plt.xlabel("Epoch")
+        plt.ylabel("Mean |Coefficient|")
+        plt.title("Average Magnitude of Trainable Coefficients (All)")
+        plt.grid(True)
+        plt.legend()
+        plt.show()
+
+        # --- Plot per column average coefficient magnitude ---
+        mean_per_col = list(zip(*self.history['mean_coef_per_col']))  # transpose to [col][epoch]
+        for j, col_vals in enumerate(mean_per_col):
+            plt.plot(col_vals, label=f'Column {j}')
+        plt.xlabel("Epoch")
+        plt.ylabel("Mean |Coefficient|")
+        plt.title("Average Coefficient Magnitude per Output Column")
+        plt.grid(True)
+        plt.legend()
+        plt.show()
 
         self.save_results()
 
@@ -255,3 +313,24 @@ class TrainModel:
             callback_list.append(SindyCall(threshold=params2["sindy_threshold"], update_freq=params2["sindycall_freq"], x=x))
 
         return callback_list
+    
+    def simulate_sindy_trajectory(self, z0, timesteps=1000, dt=0.01):
+        z0 = torch.tensor(z0, dtype=torch.float32).to(self.device)
+        z_traj = [z0]
+
+        def f(z):
+            theta_z = self.model.sindy.theta(z.unsqueeze(0))  # shape [1, library_dim]
+            dz = torch.matmul(theta_z, self.model.sindy.coefficients).squeeze(0)
+            return dz
+
+        z_curr = z0
+        for _ in range(timesteps - 1):
+            k1 = f(z_curr)
+            k2 = f(z_curr + 0.5 * dt * k1)
+            k3 = f(z_curr + 0.5 * dt * k2)
+            k4 = f(z_curr + dt * k3)
+            z_next = z_curr + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+            z_traj.append(z_next)
+            z_curr = z_next
+
+        return torch.stack(z_traj, dim=0)
