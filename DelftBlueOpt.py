@@ -19,12 +19,14 @@ n_human = int(n_jobs/4)
 #As a double check:
 print(f"SLURM_CPUS_PER_TASK detected: {n_jobs}")
 print(f"Hyperparameter trials to run: {2*n_jobs}")
+os.remove("optuna_study.db")  # or your full path
+
 
 start_time = time.time()
 device = torch.device("cpu")
 device_type = "GPU" if device.type == "cuda" else "CPU"
 params["input_dim"] = params["svd_dim"]
-optimizer = HyperparameterOptimizer(n_trials=2*n_jobs, n_jobs=n_jobs)
+optimizer = HyperparameterOptimizer(n_trials=8, n_jobs=4)
 best = optimizer.run()
 end_time = time.time()
 print(f"Best hyperparameters: {best}")

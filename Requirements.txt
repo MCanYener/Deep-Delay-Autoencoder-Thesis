@@ -1,0 +1,9 @@
+torch
+torchmetrics
+numpy
+pandas
+scikit-learn
+matplotlib
+scipy
+optuna
+pysindy

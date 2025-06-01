@@ -81,6 +81,42 @@ class TrialEvaluator:
         plt.tight_layout()
         plt.show()
 
+               # --- Simulated trajectory from learned SINDy model ---
+        print("Simulating SINDy model from latent z0...")
+
+        # Use initial latent state z0
+        with torch.no_grad():
+            z_latent = model.encoder(x_raw)  # [T, latent_dim]
+            z0 = z_latent[0]
+
+            # Simulate using the SINDy model
+            z_sim = self.trainer.simulate_sindy_trajectory(z0, timesteps=z_latent.shape[0], dt=self.params["dt"])
+            z_sim_np = z_sim.detach().cpu().numpy()
+            x_sim = model.decoder(z_sim.to(device)).cpu().numpy()
+
+        # --- Plot SINDy-simulated vs. true trajectory ---
+        plt.figure(figsize=(10, 4))
+        plt.plot(synth_data.z[:, 0], label="True Lorenz z[0]")  # ← This was synth_data.x
+        plt.plot(x_sim[:, 0], label="SINDy Simulated x[0]", linestyle="--")
+        plt.legend()
+        plt.title("SINDy Simulation vs True Latent")
+        plt.xlabel("Time step")
+        plt.ylabel("z[0] value")
+        plt.grid(True)
+        plt.show()
+
+        # --- 3D phase space plot ---
+        fig = plt.figure(figsize=(14, 6))
+        ax1 = fig.add_subplot(1, 2, 1, projection='3d')
+        ax1.plot(synth_data.z[:, 0], synth_data.z[:, 1], synth_data.z[:, 2], color='blue', linewidth=1.5)
+        ax1.set_title("True Lorenz Phase Space")
+
+        ax2 = fig.add_subplot(1, 2, 2, projection='3d')
+        ax2.plot(z_sim_np[:, 0], z_sim_np[:, 1], z_sim_np[:, 2], color='green', linewidth=1.5)
+        ax2.set_title("SINDy Simulated Phase Space")
+        plt.tight_layout()
+        plt.show()
+
 class TopTrialSelector:
     def __init__(self, db_path, study_name, top_k=5):
         """

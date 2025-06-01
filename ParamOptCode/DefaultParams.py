@@ -15,7 +15,7 @@ params = {
     'widths_ratios': [1.0, 6/7, 5/6, 4/5, 3/4],
 
     # Training
-    'max_epochs': 1000,
+    'max_epochs': 3000,
     'patience': 20,
     'batch_size': 128,
     'learning_rate': 1e-3,
@@ -32,7 +32,7 @@ params = {
     'loss_weight_layer_l1': 0.0,
 
     # SINDy
-    'coefficient_threshold': 0.1,
+    'coefficient_threshold': 0.01,
     'threshold_frequency': 5,
     'print_frequency': 10,
     'sindy_pert': 0.0,
@@ -42,6 +42,7 @@ params = {
     'use_bias': True,
     'tend': 32,
     'dt': 0.01,
+    'rfe_frequency': 10,
 
     # Misc
     'train_ratio': 0.8,
@@ -49,7 +50,11 @@ params = {
     'save_checkpoints': False,
     'save_freq': 5,
     'learning_rate_sched': False,
-    'use_sindycall': True,
+    'use_sindycall': False,
+    'sindycall_start': 600,
+    'rfe_start': 200,
+    'sindy_print_rate': 10,
+    'loss_print_rate': 10,
     'sparse_weighting': None,
     'system_coefficients': None,
     'update_freq': 10,
@@ -57,20 +62,20 @@ params = {
     #Constraints
     
 #    "sindy_fixed_mask": np.array([
-#        [False, False, False],
-#        [False, False, False],
-#        [False,  True, False],
-#        [False, False, False],
-#        [False, False, False],
-#        [False,  True, False],
-#        [False, False, False],
-#        [ True,  True,  True],
-#        [ True,  True,  True],
-#        [ True,  True,  True],
+#        [True, True, True], #1
+#        [False, False, False], #x
+#        [False,  True, False], #y
+#        [False, False, False], #z
+#        [True, True, True], #x^2
+#        [False,  False, False], #xy
+#        [False, True, False], #xz
+#        [ True,  True,  True], #y^2
+#        [ False,  False,  False], #yz
+#        [ True,  True,  True], #z^2
 #    ], dtype=bool),
     "sindy_fixed_mask": np.array([
-        [False, False, False],
-        [False, False, False],
+       [False, False, False],
+       [False, False, False],
         [False,  False, False],
         [False, False, False],
         [False, False, False],
@@ -87,8 +92,8 @@ params = {
         [0., -1.,  0.],
         [0.,  0.,  0.],
         [0.,  0.,  0.],
-        [0.,  1.,  0.],
         [0.,  0.,  0.],
+        [0.,  -1.,  0.],
         [0.,  0.,  0.],
         [0.,  0.,  0.],
         [0.,  0.,  0.],
