@@ -1,180 +1,110 @@
 import numpy as np
 from scipy.integrate import odeint, solve_ivp
 import tqdm
-from DataGenerationCode.DataGeneration import LorenzSystem  
+from DataGenerationCode.DataGeneration import LorenzSystem, GlycolysisSystem 
 from AdditionalFunctionsCode.HelpfulFunctions import get_hankel, get_hankel_svd
+from sklearn.preprocessing import StandardScaler
+
 
 class SynthData:
-    def __init__(self, input_dim=128, normalization=None):
-        """
-        Generates synthetic data using the Lorenz system and constructs a Hankel matrix.
-
-        Args:
-            input_dim (int): Number of time delays for Hankel matrix.
-            normalization (np.ndarray or None): Normalization factors (default: ones).
-        """
+    def __init__(self, input_dim=128, normalization=None, num_trajectories=1, model_tag='lorenz', params = None,  observable_dim=1):
         self.input_dim = input_dim
-        self.lorenz = LorenzSystem()  # Instantiate the Lorenz system
-        self.normalization = np.ones(3) if normalization is None else np.array(normalization)
+        self.num_trajectories = num_trajectories
+        self.model_tag = model_tag.lower()
+        self.observable_dim = observable_dim
+        self.params = params
 
-    def solve_ivp_chunked(self, z0, time, chunk_size=2000):
-        """
-        Solves the Lorenz system using solve_ivp in chunks.
-        
-        Args:
-            z0 (np.ndarray): Initial condition.
-            time (np.ndarray): Time array.
-            chunk_size (int): Number of time steps per chunk.
+        # Choose system
+        if self.model_tag == 'lorenz':
+            self.system = LorenzSystem()
+        elif self.model_tag == 'glyco':
+            self.system = GlycolysisSystem()
+        else:
+            raise ValueError(f"Unknown system_name: {model_tag}")
 
-        Returns:
-            z (np.ndarray): Simulated state trajectory.
-            dz (np.ndarray): Time derivative at each step.
-        """
-        f = self.lorenz.dynamics  # Ensure this function takes (t, z) and returns dz/dt
-        num_steps = len(time)
-        
-        z_list = []
-        dz_list = []
-
-        # Iterate over chunks
-        for start in range(0, num_steps, chunk_size):
-            end = min(start + chunk_size, num_steps)
-            t_chunk = time[start:end]
-
-            # Solve for this chunk
-            sol = solve_ivp(lambda t, z: f(z, t), (t_chunk[0], t_chunk[-1]), z0, t_eval=t_chunk,
-                            method='RK45', rtol=1e-8, atol=1e-10)
-
-            if not sol.success:
-                raise RuntimeError(f"solve_ivp failed in chunk {start}-{end}: {sol.message}")
-
-            # Store results
-            z_list.append(sol.y.T)
-            dz_chunk = np.array([f(sol.y[:, i], t_chunk[i]) for i in range(len(t_chunk))])
-            dz_list.append(dz_chunk)
-
-            # Update initial condition for the next chunk
-            z0 = sol.y[:, -1]  # Use last point as initial condition
-
-        # Concatenate all chunks
-        z = np.vstack([chunk[1:] if i > 0 else chunk for i, chunk in enumerate(z_list)])
-        dz = np.vstack([chunk[1:] if i > 0 else chunk for i, chunk in enumerate(dz_list)])
-
-        return z, dz
-
-        
+        self.normalization = np.ones(self.system.z0_mean.shape) if normalization is None else np.array(normalization)
 
     def solve_ivp(self, z0, time):
-            """
-            Solves the Lorenz system using scipy.odeint.
+        f = self.system.dynamics
+        z = odeint(f, z0, time, rtol=1e-8, atol=1e-10)
+        dz = np.array([f(z[i], time[i]) for i in range(len(time))])
+        return z, dz
 
-            Args:
-                z0 (np.ndarray): Initial condition, shape (3,).
-                time (np.ndarray): Time array.
-
-            Returns:
-                z (np.ndarray): Simulated state trajectory.
-                dz (np.ndarray): Time derivative at each step.
-            """
-            f = self.lorenz.dynamics
-            z = odeint(f, z0, time, rtol=1e-8, atol=1e-10)
-            dz = np.array([f(z[i], time[i]) for i in range(len(time))])
-            return z, dz
-
-    def run_sim(self, tend, dt, z0, apply_svd=False, svd_dim=None, scale=True):
-        """
-        Runs the Lorenz system with chunked simulation and constructs the Hankel matrix.
-
-        Args:
-            tend (float): Simulation time duration.
-            dt (float): Time step.
-            z0 (np.ndarray): Initial condition, shape (3,).
-            apply_svd (bool): If True, performs SVD on the Hankel matrix and replaces x/dx.
-            svd_dim (int): Reduced SVD dimension (required if apply_svd=True).
-            scale (bool): If True, standardizes the SVD output.
-        """
-        from sklearn.preprocessing import StandardScaler
-
+    def run_multi_sim(self, n_trajectories, tend, dt, apply_svd=False, svd_dim=None, scale=True):
+        f = self.system.dynamics
         time = np.arange(0, tend, dt)
+        z0_mean, z0_std = self.system.z0_mean, self.system.z0_std
 
-        print("Generating Lorenz system...")
-        z, dz = self.solve_ivp(z0, time)
+        z_all, dz_all, H_all, dH_all, K_list = [], [], [], [], []
 
-        z *= self.normalization
-        dz *= self.normalization
+        # Read embedding controls from params (with defaults)
+        skip_rows = self.params.get("skip_rows", 1)   # column stride
+        row_lag   = self.params.get("row_lag", 1)     # row delay
 
-        # Use only x(t)
-        x = z[:, 0]
-        dx = dz[:, 0]
+        for _ in range(n_trajectories):
+            z0 = z0_std * (np.random.rand(len(z0_std)) - 0.5) + z0_mean
+            z, dz = self.solve_ivp(z0, time)
+            z *= self.normalization
+            dz *= self.normalization
 
-        # Build Hankel matrix
-        delays = len(time) - self.input_dim
-        H = get_hankel(x, self.input_dim, delays).T  # shape (delays, input_dim)
-        dH = get_hankel(dx, self.input_dim, delays).T  # same shape
+            # Let get_hankel compute K_max internally -> set delays=None
+            n_cols = None
 
+            if self.observable_dim == 1:
+                x  = z[:, 0]
+                dx = dz[:, 0]
+
+                H  = get_hankel(x,  self.input_dim, delays=n_cols, params=self.params, row_lag=row_lag, skip_rows=skip_rows)
+                dH = get_hankel(dx, self.input_dim, delays=n_cols, params=self.params, row_lag=row_lag, skip_rows=skip_rows)
+
+                z_all.append(z); dz_all.append(dz)
+                H_all.append(H); dH_all.append(dH)
+                K_list.append(H.shape[0])  
+                
+
+            elif self.observable_dim == 2:
+                x, y  = z[:, 0], z[:, 1]
+                dx, dy = dz[:, 0], dz[:, 1]
+
+                Hx  = get_hankel(x,  self.input_dim, delays=n_cols, params=self.params, row_lag=row_lag, skip_rows=skip_rows)
+                Hy  = get_hankel(y,  self.input_dim, delays=n_cols, params=self.params, row_lag=row_lag, skip_rows=skip_rows)
+                dHx = get_hankel(dx, self.input_dim, delays=n_cols, params=self.params, row_lag=row_lag, skip_rows=skip_rows)
+                dHy = get_hankel(dy, self.input_dim, delays=n_cols, params=self.params, row_lag=row_lag, skip_rows=skip_rows)
+
+                # With Hx/Hy shape (K, m), hstack doubles the per-column features to (K, 2m) as intended.
+                H  = np.hstack([Hx,  Hy])
+                dH = np.hstack([dHx, dHy])
+
+                z_all.append(z); dz_all.append(dz)
+                H_all.append(H); dH_all.append(dH)
+                K_list.append(H.shape[0])
+            else:
+                raise ValueError("Observable dimension must be 1 or 2.")
+
+        # Keep your stacking: (num_traj*K, m or 2m)
+        self.z       = np.concatenate(z_all, axis=0)
+        self.dz      = np.concatenate(dz_all, axis=0)
+        self.hankel  = np.vstack(H_all)
+        self.dhankel = np.vstack(dH_all)
+        self.K_per_traj = K_list
         self.t = time
-        self.z = z
-        self.dz = dz
-        self.xorig = H.copy()  # for safety/debug
-        self.sindy_coefficients = np.array(self.lorenz.Xi, dtype=np.float32)
+        self.sindy_coefficients = np.array(self.system.Xi, dtype=np.float32)
+        self.lengths = [H.shape[0] for H in H_all]
 
         if apply_svd:
-            assert svd_dim is not None, "You must specify svd_dim if apply_svd=True"
-
-            U, S, VT, rec_v = get_hankel_svd(H, reduced_dim=svd_dim)
-
+            assert svd_dim is not None, "Specify svd_dim if apply_svd=True"
+            U, S, VT, rec_v = get_hankel_svd(self.hankel, reduced_dim=svd_dim)
             if scale:
                 rec_v = StandardScaler().fit_transform(rec_v)
-
-            self.x = rec_v
+            self.x  = rec_v
             self.dx = np.gradient(rec_v, dt, axis=0)
-            self.U = U
-            self.S = S
-            self.VT = VT
-            self.hankel = H
-            self.dhankel = dH
-            print("self.x (rec_v):", self.x.shape)
-            print("self.dx:", self.dx.shape)
-
+            self.U, self.S, self.VT = U, S, VT
         else:
-            self.x = H
-            self.dx = dH
-            self.hankel = H
-            self.dhankel = dH
+            self.x  = self.hankel
+            self.dx = self.dhankel
 
-    def run_sim_chunked(self, tend, dt, z0):
-        """
-        Runs the Lorenz system with chunked simulation and constructs the Hankel matrix.
+        print("\n🧪 DEBUG: Final data shapes from run_multi_sim")
+        print(f"self.hankel.shape: {self.hankel.shape}")
+        print(f"self.x.shape: {self.x.shape}")
+        print(f"self.observable_dim: {self.observable_dim}, input_dim: {self.input_dim}")
 
-        Args:
-            tend (float): Simulation time duration.
-            dt (float): Time step.
-            z0 (np.ndarray): Initial condition, shape (3,).
-        """
-        time = np.arange(0, tend, dt)
-
-        # Solve in chunks
-        print("Generating Lorenz system solution in chunks...")
-        z, dz = self.solve_ivp_chunked(z0, time)
-
-        # Apply normalization
-        z *= self.normalization
-        dz *= self.normalization
-
-        # Extract first state variable for Hankel matrix
-        x = z[:, 0]
-        dx = dz[:, 0]
-
-        # Construct Hankel matrices
-        delays = len(time) - self.input_dim
-        H = get_hankel(x, self.input_dim, delays)
-        dH = get_hankel(dx, self.input_dim, delays)
-
-        # Store results
-        self.z = z
-        self.dz = dz
-        self.x = H
-        self.dx = dH
-        self.t = time
-        self.sindy_coefficients = np.array(self.lorenz.Xi, dtype=np.float32)
-        

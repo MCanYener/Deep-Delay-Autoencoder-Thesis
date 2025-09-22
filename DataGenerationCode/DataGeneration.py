@@ -72,3 +72,51 @@ class LorenzSystem:
         return z0_mean_sug, z0_std_sug
 
 
+class GlycolysisSystem:
+    def __init__(self, a=0.1, b=0.5, poly_order=3):
+        self.a = a
+        self.b = b
+        self.poly_order = poly_order
+
+        # Initial condition mean and std
+        self.z0_mean = np.array([2.0, 1.0])
+        self.z0_std = np.array([1.0, 0.5])
+
+        # Normalization (default to 1s unless overridden)
+        self.normalization = np.ones_like(self.z0_mean)
+
+        # Precompute SINDy coefficients for reference (unscaled)
+        self.Xi = np.zeros((library_size(2, poly_order), 2))
+        self.Xi[1, 0] = -1.0          # x
+        self.Xi[2, 0] = a             # y
+        self.Xi[7, 0] = 1.0           # x²y
+        self.Xi[0, 1] = b             # constant
+        self.Xi[2, 1] = -a            # y
+        self.Xi[7, 1] = -1.0          # x²y
+
+    def dynamics(self, s, t=None):
+        x, y = s
+        dxdt = -x + self.a * y + x**2 * y
+        dydt = self.b - self.a * y - x**2 * y
+        return [dxdt, dydt]
+
+    def compute_sindy_coefficients(self):
+        dim = 2
+        n = self.normalization
+        poly_order = self.poly_order
+        Xi = np.zeros((library_size(dim, poly_order), dim))
+
+        # dx/dt = -x + a*y + x²*y
+        Xi[1, 0] = -1.0                        # x
+        Xi[2, 0] = self.a * n[0] / n[1]        # y
+        Xi[7, 0] = n[0] / (n[0]**2 * n[1])     # x²y
+
+        # dy/dt = b - a*y - x²*y
+        Xi[0, 1] = self.b                      # constant
+        Xi[2, 1] = -self.a                     # y
+        Xi[7, 1] = -1.0                        # x²y
+
+        return torch.tensor(Xi, dtype=torch.float32)
+
+    def get_initial_conditions(self):
+        return torch.tensor(self.z0_mean), torch.tensor(self.z0_std)

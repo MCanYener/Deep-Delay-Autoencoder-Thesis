@@ -11,10 +11,12 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
 
 from SINDyCode.SINDyPreamble import library_size, sindy_library
 from SINDyCode.SINDyPreamble import sindy_library as preamble_sindy_library
-from AutoencoderCode.Autoencoder import PreSVD_Sindy_Autoencoder, RfeUpdateCallback, SindyCall
+from AutoencoderCode.Autoencoder import PreSVD_Sindy_Autoencoder, RfeUpdateCallback, SindyCall, TrajectoryWindowDataset
 
 
 class TrainModel:
@@ -25,11 +27,35 @@ class TrainModel:
         self.savename = self.get_name()
         self.hankel = torch.tensor(hankel, dtype=torch.float32) if hankel is not None else None
         self.model = self.get_model().to(self.device)
-        self.history = []
+
+        # ---- ODE-net inspection (after model is fully built and moved) ----
+        print("\n🧪 DEBUG: ODE Net (inside SINDy)")
+        if hasattr(self.model, "sindy") and hasattr(self.model.sindy, "net_model") and self.model.sindy.net_model is not None:
+            print(self.model.sindy.net_model)
+            for i, layer in enumerate(self.model.sindy.net_model):
+                if isinstance(layer, nn.Linear):
+                    print(f"  Layer {i}: Linear(in={layer.in_features}, out={layer.out_features})")
+                else:
+                    print(f"  Layer {i}: {layer.__class__.__name__}")
+        else:
+            print("  (no ODE net; ode_net=False)")
+
+        # ---- quick shape sanity check ----
+        try:
+            with torch.no_grad():
+                dummy = torch.randn(8, self.model.latent_dim, device=self.device)
+                theta = self.model.sindy.theta(dummy)  # (8, library_dim)
+                print(f"[DEBUG] dummy z: {dummy.shape}, theta(z): {theta.shape}, coeffs: {self.model.sindy.coefficients.shape}")
+                out = theta @ self.model.sindy.coefficients  # (8, latent_dim)
+                print(f"[DEBUG] (theta @ coeffs): {out.shape}  # should be (8, {self.model.latent_dim})")
+        except Exception as e:
+            print(f"[DEBUG] ODE-net/Theta shape check skipped due to error: {e}")
+
+        self.history = defaultdict(list)
 
     def get_name(self, include_date=True):
         pre = "results"
-        post = f"{self.params['model']}_{self.params['case']}"
+        post = f"{self.params['model_tag']}"
         if include_date:
             name = f"{pre}_{datetime.datetime.now().strftime('%Y%m%d%H%M')}_{post}"
         else:
@@ -38,7 +64,11 @@ class TrainModel:
 
     def fix_params(self, params):
         input_dim = params["input_dim"]
-        params["widths"] = [int(i * input_dim) for i in params["widths_ratios"]]
+        observable_dim = params['observable_dim']
+        if observable_dim == 1:
+            widths = params["widths_1d"]
+        else:
+            widths = params["widths_2d"]
 
         if "coefficient_threshold" not in params:
             params["coefficient_threshold"] = 1e-2
@@ -73,12 +103,12 @@ class TrainModel:
 
         return params
 
-    def get_data(self):
+    #def get_data(self):
         # By default, just use x and dx
-        train_x, test_x = train_test_split(self.data.x, train_size=self.params["train_ratio"], shuffle=False)
-        train_dx, test_dx = train_test_split(self.data.dx, train_size=self.params["train_ratio"], shuffle=False)
+        #train_x, test_x = train_test_split(self.data.x, train_size=self.params["train_ratio"], shuffle=False)
+        #train_dx, test_dx = train_test_split(self.data.dx, train_size=self.params["train_ratio"], shuffle=False)
 
-        return (train_x, train_dx), (test_x, test_dx)
+        #return (train_x, train_dx), (test_x, test_dx)
 
     def get_model(self):
         # 🔍 Debug: Check fixed mask and values
@@ -100,31 +130,72 @@ class TrainModel:
         return PreSVD_Sindy_Autoencoder(self.params, hankel = self.hankel)
 
     def fit(self):
-        train_data, test_data = self.get_data()
+        #train_data, test_data = self.get_data()
         self.save_params()
 
         os.makedirs(os.path.join(self.params["data_path"], self.savename), exist_ok=True)
 
-        optimizer = Adam(self.model.parameters(), lr=self.params["learning_rate"])
-        decay_rate = self.params["lr_decay"]
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: decay_rate ** epoch)
+        # === Separate parameter groups ===
+        ae_params = [p for name, p in self.model.named_parameters() if p.requires_grad and "sindy.coefficients" not in name]
+        sindy_params = [p for name, p in self.model.named_parameters() if p.requires_grad and "sindy.coefficients" in name]
 
-        train_x = torch.tensor(train_data[0], dtype=torch.float32)
-        train_dx = torch.tensor(train_data[1], dtype=torch.float32)
-        test_x = torch.tensor(test_data[0], dtype=torch.float32).to(self.device)
-        test_dx = torch.tensor(test_data[1], dtype=torch.float32).to(self.device)
+        # === Optimizers ===
+        optimizer_ae = torch.optim.Adam(ae_params, lr=self.params["learning_rate"])
+        optimizer_sindy = torch.optim.Adam(sindy_params, lr=self.params.get("sindy_learning_rate", self.params["learning_rate"]))
 
-        train_dataset = TensorDataset(train_x.to(self.device), train_dx.to(self.device))
-        train_loader = DataLoader(train_dataset, batch_size=self.params["batch_size"], shuffle=True)
+        scheduler_ae = torch.optim.lr_scheduler.LambdaLR(
+            optimizer_ae, lr_lambda=lambda epoch: self.params["lr_decay_ae"] ** epoch
+        )
+        scheduler_sindy = torch.optim.lr_scheduler.LambdaLR(
+            optimizer_sindy, lr_lambda=lambda epoch: self.params["lr_decay_sindy"] ** epoch
+        )
 
-        self.history = defaultdict(list)
+        # === Training data setup ===
+        # === Sequence training data (B, T, D) without crossing boundaries ===
+        window_T      = int(self.params.get("window_T", 20))   # pick your horizon
+        window_stride = int(self.params.get("window_stride", 1))
 
-        print("\nActive Loss Weights:")
-        for k in self.params:
-            if "loss_weight" in k and self.params[k] > 0:
-                print(f"{k}: {self.params[k]}")
+        lengths = getattr(self.data, "lengths", None)
+        if lengths is None:
+            # fallback if lengths not provided (assume equal splits by n_ics)
+            n_ics = int(self.params.get("n_ics", 1))
+            per = self.data.x.shape[0] // max(n_ics, 1)
+            lengths = [per] * n_ics
 
-        # ✅ SINDyCall logic (ON by default unless explicitly disabled)
+        # --- quick guard ---
+        min_len = min(lengths)
+        if window_T > min_len:
+            raise ValueError(
+                f"window_T={window_T} is larger than the shortest trajectory ({min_len}). "
+                f"Lower window_T or generate longer trajectories."
+)
+
+        full_seq_ds = TrajectoryWindowDataset(
+            X=self.data.x, dX=self.data.dx, lengths=lengths,
+            T=window_T, stride=window_stride
+        )
+
+        # split by windows, not raw rows
+        n_total = len(full_seq_ds)
+        n_train = int(self.params["train_ratio"] * n_total)
+        train_indices = list(range(n_train))
+        val_indices   = list(range(n_train, n_total))
+
+        from torch.utils.data import Subset
+        train_dataset = Subset(full_seq_ds, train_indices)
+        val_dataset   = Subset(full_seq_ds, val_indices)
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=self.params["batch_size"], shuffle=True, pin_memory=True
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=self.params["batch_size"], shuffle=False, pin_memory=True
+        )
+
+        # quick sanity print
+        xb, dxb = next(iter(train_loader))
+        print(f"[SEQ DEBUG] batch shapes: x {xb.shape}, dx {dxb.shape}")  # -> (B, T, D)
+
         if self.params.get("use_sindycall", True):
             self.sindy_caller = SindyCall(
                 model=self.model,
@@ -132,157 +203,161 @@ class TrainModel:
                 threshold=self.params["coefficient_threshold"],
                 update_freq=self.params.get("update_freq", 10),
                 x=self.data.x,
-                t=self.data.t
+                t=self.data.t,
+                lengths = lengths
             )
         else:
             self.sindy_caller = None
-        
-        rfe_callback = RfeUpdateCallback(self.model, 
-                                 rfe_frequency=self.params.get("rfe_frequency", 10),
-                                 print_frequency=self.params.get("sindy_print_rate", 10),
-                                 rfe_start = self.params.get("rfe_start", 200),)
-        
-        print("Launching training with coefficient_threshold =", self.params["coefficient_threshold"])
 
-        for epoch in range(self.params["max_epochs"]):
-            self.model.train()
-            epoch_loss = 0.0
-            if epoch == 0:
-                self.model.sindy.print_trainability_report("(After Epoch 0)")
-
-            for batch_x, batch_dx in train_loader:
-                optimizer.zero_grad()
-
-                inputs = (batch_x, batch_x, batch_dx)
-                outputs = (batch_x, batch_x, batch_dx)
-
-                loss, losses = self.model.get_loss(*inputs, *outputs)
-
-                loss.backward()
-
-                # Clamp gradients to prevent optimizer explosions
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
-                for name, param in self.model.named_parameters():
-                    if param.grad is not None and torch.isnan(param.grad).any():
-                        print(f"❌ NaN in gradient for {name}")
-                        raise RuntimeError("Aborting due to NaN gradients.")
-
-                optimizer.step()
-                with torch.no_grad():
-                    if torch.isnan(self.model.sindy.coefficients).any() or torch.isinf(self.model.sindy.coefficients).any():
-                        print("❌ NaN or Inf in coefficients after optimizer step. Clamping and continuing.")
-                        self.model.sindy.coefficients.data = torch.nan_to_num(
-                            self.model.sindy.coefficients.data,
-                            nan=0.0, posinf=1e2, neginf=-1e2
+        rfe_callback = RfeUpdateCallback(
+            self.model,
+            rfe_frequency=self.params.get("rfe_frequency", 10),
+            print_frequency=self.params.get("sindy_print_rate", 10),
+            rfe_start=self.params.get("rfe_start", 200),
         )
 
-                with torch.no_grad():
-                    # Strict enforcement of fixed entries
-                    fixed_mask = self.model.sindy.fixed_mask
-                    fixed_vals = self.model.sindy.fixed_values
-                    coeffs = self.model.sindy.coefficients
+        sindy_trainable = self.params.get("train_sindy", True)
+        sindy_train_start = self.params.get("sindy_train_start", 0)
 
-                    # Reset any drifted fixed values (in case of numerical error)
-                    coeffs[fixed_mask] = fixed_vals[fixed_mask]
+        print("\n🧪 DEBUG: Starting fit()")
+        print(f"self.data.x.shape: {self.data.x.shape}")
+        print(f"input_dim: {self.params['input_dim']}")
+        print(f"observable_dim: {self.params['observable_dim']}")
+        print(f"svd_dim: {self.params['svd_dim']}")
+        print(f"Expecting encoder input size: {self.model.encoder[0].in_features}")
 
-                    # Optional: enforce soft sparsity mask manually (RFE style)
-                    if self.params.get("coefficient_threshold") is not None and epoch > 200:
-                        mask = coeffs.abs() > self.params["coefficient_threshold"]
-                        coeffs *= mask.float()  # zero out small coefficients
-                        self.model.sindy.coefficients_mask = mask
+        # === Training loop ===
+        for epoch in range(self.params["max_epochs"]):
+            self.model.train()
 
-                    # Double check that constraints hold
-                    if not torch.allclose(coeffs[fixed_mask], fixed_vals[fixed_mask], atol=1e-6):
-                        print("❌ Fixed coefficient mismatch!")
-                        diff = coeffs[fixed_mask] - fixed_vals[fixed_mask]
-                        print("Max difference:", diff.abs().max().item())
-                        print("Full matrix:\n", coeffs.cpu().numpy())
-                        print("Expected fixed values:\n", fixed_vals.cpu().numpy())
+            # per-epoch aggregators
+            total_sum = 0.0
+            n_batches = 0
+            comp_sums = defaultdict(float)  # sums for each component loss
+            comp_counts = defaultdict(int)  # how many batches produced that loss key
 
-                epoch_loss += loss.item()
+            for batch_x, batch_dx in train_loader:
 
-            # Log all sub-losses (Part I just changed)
-            self.history["train_rec"].append(losses.get("rec", torch.tensor(0.0)).detach().cpu().item())
-            self.history["train_sindy_z"].append(losses.get("sindy_z", torch.tensor(0.0)).detach().cpu().item())
-            self.history["train_sindy_x"].append(losses.get("sindy_x", torch.tensor(0.0)).detach().cpu().item())
-            self.history["train_integral"].append(losses.get("integral", torch.tensor(0.0)).detach().cpu().item())
-            self.history["train_x0"].append(losses.get("x0", torch.tensor(0.0)).detach().cpu().item())
-            self.history["train_l1"].append(losses.get("l1", torch.tensor(0.0)).detach().cpu().item())
+                batch_x = batch_x.to(self.device, non_blocking=True)   # (B,T,D)
+                batch_dx = batch_dx.to(self.device, non_blocking=True)
+                optimizer_ae.zero_grad()
+                optimizer_sindy.zero_grad()
 
-            epoch_loss /= len(train_loader)
-            self.history["train_total"].append(epoch_loss)
+                loss, batch_losses = self.model.get_loss(
+                    batch_x, batch_x, batch_dx, batch_x, batch_x, batch_dx, epoch=epoch
+                )
+                loss.backward()
 
-            scheduler.step()
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None:
+                        if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                            print(f"❌ NaN/Inf in gradient for {name}")
+                            raise RuntimeError("Aborting due to NaN or Inf in gradients.")
+                        param.grad.data = torch.nan_to_num(param.grad.data, nan=0.0, posinf=1e3, neginf=-1e3)
+                        param.grad.data.clamp_(-500.0, 500.0)
 
-            # 🔍 LOG average coefficient stats (ADD HERE)
-            trainable_mask = ~fixed_mask
-            mean_all = coeffs[trainable_mask].abs().mean().item()
-            mean_per_column = []
-            for j in range(coeffs.shape[1]):
-                col_mask = trainable_mask[:, j]
-                if col_mask.sum() > 0:
-                    mean_per_column.append(coeffs[:, j][col_mask].abs().mean().item())
+                optimizer_ae.step()
+                if sindy_trainable and epoch >= sindy_train_start:
+                    optimizer_sindy.step()
+
+                # accumulate
+                total_sum += float(loss.detach().cpu())
+                n_batches += 1
+                for k, v in batch_losses.items():
+                    comp_sums[k] += float(v.detach().cpu())
+                    comp_counts[k] += 1
+
+            # === Validation ===
+            val_total = 0.0
+            val_batches = 0
+            val_comp_sums = defaultdict(float)
+            val_comp_counts = defaultdict(int)
+
+            self.model.eval()
+            with torch.no_grad():
+                for vx, vdx in val_loader:
+                    vx  = vx.to(self.device, non_blocking=True)   # (B,T,D)
+                    vdx = vdx.to(self.device, non_blocking=True)
+
+                    with torch.enable_grad():
+                        vloss, vlosses = self.model.get_loss(vx, vx, vdx, vx, vx, vdx, epoch=epoch)
+                        
+                    val_total += float(vloss.detach().cpu())
+                    val_batches += 1
+                    for k, v in vlosses.items():
+                        val_comp_sums[k]  += float(v.detach().cpu())
+                        val_comp_counts[k] += 1
+
+
+            # === Logging (epoch-averaged) ===
+            all_loss_names = ["rec","sindy_z","sindy_x","integral","x0","l1","l1_group","sindy_x0","sindy_y0"]
+
+            # --- Train ---
+            epoch_avg_total = total_sum / max(n_batches, 1)
+            self.history["train_total"].append(epoch_avg_total)
+            for name in all_loss_names:
+                if comp_counts[name] > 0:
+                    self.history[f"train_{name}"].append(comp_sums[name] / comp_counts[name])
                 else:
-                    mean_per_column.append(float('nan'))
+                    self.history[f"train_{name}"].append(0.0)
 
-            self.history['mean_coef_all'].append(mean_all)
-            self.history['mean_coef_per_col'].append(mean_per_column)
+            # --- Validation ---
+            self.history["val_total"].append(val_total / max(val_batches, 1))
+            for name in all_loss_names:
+                if val_comp_counts[name] > 0:
+                    self.history[f"val_{name}"].append(val_comp_sums[name] / val_comp_counts[name])
+                else:
+                    self.history[f"val_{name}"].append(0.0)  # or float("nan")
 
-            if epoch % self.params["loss_print_rate"] == 0:
-                print(f"Epoch {epoch}: Loss = {epoch_loss:.6f} | LR = {optimizer.param_groups[0]['lr']:.6f}")
-
-            if epoch % self.params["sindy_print_rate"] == 0:
+            scheduler_ae.step()
+            scheduler_sindy.step()
+            # === Periodic prints ===
+            if epoch % self.params.get("sindy_print_rate", 10) == 0:
+                ae_lr = scheduler_ae.get_last_lr()[0]
+                sindy_lr = scheduler_sindy.get_last_lr()[0]
+                print(f"Epoch {epoch}: Loss = {epoch_avg_total:.6f}")
+                print(f"AE LR: {ae_lr:.6f} | SINDy LR: {sindy_lr:.6f}")
                 print("--- SINDy Coefficient Matrix (Sanity Check) ---")
                 print(self.model.sindy.coefficients.detach().cpu().numpy())
 
-            with torch.no_grad():
-                coeff_matrix = self.model.sindy.coefficients
-                if torch.isnan(coeff_matrix).any():
-                    print("❌ SINDy matrix contains NaN entities! Stopping training.")
-                    raise RuntimeError("SINDy matrix contains NaN entities!")
-            
+                if self.params.get("train_sindy", True):
+                    start = self.params.get("sindy_train_start", 0)
+                    ramp = self.params.get("sindy_ramp_duration", 500)
+                    if epoch >= start:
+                        sindy_scale = min((epoch - start) / float(ramp), 1.0)
+                    else:
+                        sindy_scale = 0.0
+                    print(f"SINDy scale factor: {sindy_scale:.3f}")
+
+            if (
+                self.sindy_caller
+                and self.sindy_caller.last_model is not None
+                and self.sindy_caller.last_epoch == epoch
+            ):
+                print("--- PySINDy Discovered Model ---")
+                self.sindy_caller.last_model.print()
+
             rfe_callback.update_rfe(epoch)
 
-            # ✅ Trigger SINDyCall if active
             if self.sindy_caller:
                 self.sindy_caller.update_sindy(epoch)
 
-                # --- Plot average coefficient magnitude ---
-        plt.figure(figsize=(10, 4))
-        plt.plot(self.history['mean_coef_all'], label='Mean of All Trainable Coefficients')
-        plt.xlabel("Epoch")
-        plt.ylabel("Mean |Coefficient|")
-        plt.title("Average Magnitude of Trainable Coefficients (All)")
-        plt.grid(True)
-        plt.legend()
-        plt.show()
-
-        # --- Plot per column average coefficient magnitude ---
-        mean_per_col = list(zip(*self.history['mean_coef_per_col']))  # transpose to [col][epoch]
-        for j, col_vals in enumerate(mean_per_col):
-            plt.plot(col_vals, label=f'Column {j}')
-        plt.xlabel("Epoch")
-        plt.ylabel("Mean |Coefficient|")
-        plt.title("Average Coefficient Magnitude per Output Column")
-        plt.grid(True)
-        plt.legend()
-        plt.show()
-
+        # === Save results ===
         self.save_results()
-
+        
     def save_params(self):
         os.makedirs(self.params["data_path"], exist_ok=True)
         df = pd.DataFrame([self.params])
         df.to_pickle(os.path.join(self.params["data_path"], self.savename + "_params.pkl"))
 
     def save_results(self):
-        # Create general folder if missing
+
+        # Create folders
         os.makedirs(self.params["data_path"], exist_ok=True)
-        
-        # Create model-specific folder if missing
         model_dir = os.path.join(self.params["data_path"], self.savename)
         os.makedirs(model_dir, exist_ok=True)
 
+        # Save loss and coefficients
         results_dict = {
             "losses": self.history,
             "sindy_coefficients": self.model.sindy.coefficients.detach().cpu().numpy()
@@ -290,16 +365,24 @@ class TrainModel:
         df = pd.DataFrame([results_dict])
         df.to_pickle(os.path.join(self.params["data_path"], self.savename + "_results.pkl"))
         torch.save(self.model.state_dict(), os.path.join(model_dir, "model.pth"))
-        # --- Print final SINDy model ---
-        coefs = self.model.sindy.coefficients.detach().cpu().numpy()
-        library_size = coefs.shape[0]
-        dim = coefs.shape[1]    
-        terms = []
 
-        # Reconstruct library terms (assuming poly order up to 2 for simplicity)
-        basis = ['1'] + [f'z{i}' for i in range(self.model.latent_dim)]
-        if self.params['poly_order'] >= 2:
-            basis += [f'z{i}z{j}' for i in range(self.model.latent_dim) for j in range(i, self.model.latent_dim)]
+        # === Generate Basis Terms Consistently ===
+        latent_sample = self.model.encoder(torch.tensor(self.data.x[:100], dtype=torch.float32).to(self.device)).detach().cpu().numpy()
+
+        _, basis = sindy_library(
+            latent_sample,
+            poly_order=self.params["poly_order"],
+            include_sine=self.params.get("include_sine", False),
+            include_names=True,
+            exact_features=self.params.get("exact_features", False)
+        )
+
+        # === Print Final SINDy Equations ===
+        coefs = self.model.sindy.coefficients.detach().cpu().numpy()
+        library_size, dim = coefs.shape
+
+        if len(basis) != library_size:
+            print(f"[WARNING] Length of basis ({len(basis)}) does not match coefficient shape ({library_size})")
 
         print("\nFinal SINDy Model:")
         for eq in range(dim):
@@ -329,7 +412,7 @@ class TrainModel:
 
         return callback_list
     
-    def simulate_sindy_trajectory(self, z0, timesteps=1000, dt=0.01):
+    def simulate_sindy_trajectory(self, z0, timesteps=3200, dt=0.01):
         z0 = torch.tensor(z0, dtype=torch.float32).to(self.device)
         z_traj = [z0]
 
